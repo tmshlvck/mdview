@@ -9,7 +9,7 @@ use url::Url;
 // Configuration constants
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct MarkdownConfig {
     enable_tables: bool,
     enable_footnotes: bool,
@@ -167,22 +167,44 @@ fn main() {
         return;
     }
 
-    // Launch the GUI application
-    dioxus::launch(app);
+    // Store config and file path in environment for the GUI app
+    std::env::set_var("MDVIEW_FILE_PATH", file_path.to_string_lossy().as_ref());
+    std::env::set_var("MDVIEW_CONFIG", serde_json::to_string(&config).unwrap_or_default());
+
+    // Launch the GUI application with desktop config
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(dioxus::desktop::Config::new()
+            .with_menu(None) // Disable the useless menu
+            .with_window(dioxus::desktop::WindowBuilder::new()
+                .with_title("Markdown Display")
+                .with_resizable(true)))
+        .launch(app);
 }
 
 fn app() -> Element {
-    // Get the file path from command line args
-    let file_path = use_memo(|| {
-        let args: Vec<String> = std::env::args().collect();
-        if args.len() >= 2 {
-            PathBuf::from(&args[1])
+    // Get the file path and config from environment variables set by main()
+    let file_path = use_signal(|| {
+        if let Ok(path_str) = std::env::var("MDVIEW_FILE_PATH") {
+            PathBuf::from(path_str)
         } else {
-            PathBuf::from("README.md") // fallback
+            // Fallback to command line args if env var not set
+            let args: Vec<String> = std::env::args().collect();
+            if args.len() >= 2 {
+                PathBuf::from(&args[1])
+            } else {
+                PathBuf::from("README.md")
+            }
         }
     });
 
-    let config = use_signal(|| MarkdownConfig::default());
+    let config = use_signal(|| {
+        if let Ok(config_str) = std::env::var("MDVIEW_CONFIG") {
+            serde_json::from_str(&config_str).unwrap_or_default()
+        } else {
+            MarkdownConfig::default()
+        }
+    });
+
     let mut content = use_signal(String::new);
     let mut last_modified = use_signal(|| None::<std::time::SystemTime>);
 
@@ -241,11 +263,14 @@ fn app() -> Element {
             }
         }
     } else {
-        let html_content = markdown_to_html(&current_content, &file_path(), &config.read());
+        let html_content = markdown_to_html(&current_content, &file_path(), &config());
         rsx! {
             div {
-                style: "width: 100vw; height: 100vh; overflow: auto; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;",
-                dangerous_inner_html: "{html_content}"
+                style: "margin: 0; padding: 0; width: 100%; height: 100vh; overflow-y: auto; overflow-x: hidden;",
+                div {
+                    style: "max-width: 800px; margin: 0 auto; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;",
+                    dangerous_inner_html: "{html_content}"
+                }
             }
         }
     }
@@ -265,15 +290,23 @@ fn markdown_to_html(content: &str, file_path: &Path, config: &MarkdownConfig) ->
 
     format!(
         r#"<!DOCTYPE html>
-<html>
+<html style="margin: 0; padding: 0; height: 100%;">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
+        * {{
+            box-sizing: border-box;
+        }}
+
+        html, body {{
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+        }}
+
         body {{
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             line-height: 1.6;
             color: #333;
@@ -393,8 +426,8 @@ fn transform_relative_path(url: &str, file_path: &Path) -> String {
     if let Some(parent) = file_path.parent() {
         let full_path = parent.join(url);
         if let Ok(canonical) = full_path.canonicalize() {
-            // Convert to file:// URL for local files
-            return format!("file://{}", canonical.display());
+            // Print canonical path for local files
+            return canonical.display().to_string();
         } else {
             // Fallback: just join the paths
             return parent.join(url).display().to_string();
@@ -412,4 +445,6 @@ dioxus = { version = "0.6", features = ["desktop"] }
 pulldown-cmark = { version = "0.12", features = ["simd"] }
 tokio = { version = "1.0", features = ["full"] }
 url = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 */

@@ -2631,12 +2631,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2532096657941c2fea9c289d370a250971c689d4f143798ff67113ec042024a5"
 
 [[package]]
-name = "mdedit"
+name = "mdview"
 version = "0.1.0"
 dependencies = [
  "clap",
  "dioxus",
  "pulldown-cmark",
+ "serde",
+ "serde_json",
  "tokio",
  "url",
 ]

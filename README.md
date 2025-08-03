@@ -1,4 +1,6 @@
-# Simple and fast MarkDown editor in Rust
+# Simple and fast MarkDown viewer in Rust
+
+MarkDown viewer that can be used as an aid in writing MD - just open it next to your editor in tiled mode.
 
 ## Build
 
