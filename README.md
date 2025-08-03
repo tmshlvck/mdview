@@ -20,10 +20,11 @@ sudo apt install libwebkit2gtk-4.1-dev \
 cargo install dioxus-cli
 ```
 
-## Test
+## Installation and use
 
 ```
-cargo run -- README.md
+cargo install --path . --root ~/.local
+mdview README.md
 ```
 
 ## Credits
