@@ -1,4 +1,5 @@
 use clap::{Arg, Command};
+
 use dioxus::prelude::*;
 use pulldown_cmark::{html, CowStr, Event, LinkType, Options, Parser, Tag};
 use std::fs;
@@ -169,15 +170,20 @@ fn main() {
 
     // Store config and file path in environment for the GUI app
     std::env::set_var("MDVIEW_FILE_PATH", file_path.to_string_lossy().as_ref());
-    std::env::set_var("MDVIEW_CONFIG", serde_json::to_string(&config).unwrap_or_default());
+    std::env::set_var(
+        "MDVIEW_CONFIG",
+        serde_json::to_string(&config).unwrap_or_default(),
+    );
 
     // Launch the GUI application with desktop config
     dioxus::LaunchBuilder::desktop()
-        .with_cfg(dioxus::desktop::Config::new()
-            .with_menu(None) // Disable the useless menu
-            .with_window(dioxus::desktop::WindowBuilder::new()
-                .with_title("Markdown Display")
-                .with_resizable(true)))
+        .with_cfg(
+            dioxus::desktop::Config::new().with_menu(None).with_window(
+                dioxus::desktop::WindowBuilder::new()
+                    .with_title("Markdown Display")
+                    .with_resizable(true),
+            ),
+        )
         .launch(app);
 }
 
@@ -207,6 +213,12 @@ fn app() -> Element {
 
     let mut content = use_signal(String::new);
     let mut last_modified = use_signal(|| None::<std::time::SystemTime>);
+
+    // Search state
+    let mut show_search = use_signal(|| false);
+    let mut search_pattern = use_signal(String::new);
+    let mut search_results = use_signal(|| Vec::<usize>::new());
+    let mut current_result_index = use_signal::<Option<usize>>(|| None);
 
     // Load initial content
     use_effect(move || {
@@ -254,6 +266,14 @@ fn app() -> Element {
         });
     });
 
+    // Scroll to current search result
+    use_effect(move || {
+        if let Some(_) = *current_result_index.read() {
+            // Note: In Dioxus 0.6, direct JS eval is not available
+            // The scrolling will happen via the id attributes in the HTML
+        }
+    });
+
     let current_content = content.read();
     if current_content.is_empty() {
         rsx! {
@@ -263,13 +283,208 @@ fn app() -> Element {
             }
         }
     } else {
-        let html_content = markdown_to_html(&current_content, &file_path(), &config());
+        let html_content = if search_pattern.read().is_empty() || search_results.read().is_empty() {
+            markdown_to_html(&current_content, &file_path(), &config())
+        } else {
+            // Highlight search results
+            let pattern = search_pattern.read().clone();
+            let results = search_results.read().clone();
+            let current_idx = *current_result_index.read();
+            let highlighted =
+                highlight_search_results(&current_content, &pattern, &results, current_idx);
+            markdown_to_html(&highlighted, &file_path(), &config())
+        };
+
         rsx! {
             div {
-                style: "margin: 0; padding: 0; width: 100%; height: 100vh; overflow-y: auto; overflow-x: hidden;",
+                style: "margin: 0; padding: 0; width: 100%; height: 100vh; display: flex; flex-direction: column;",
+                tabindex: "0",
+                onkeydown: move |evt| {
+                    if evt.modifiers().ctrl() && evt.code() == Code::KeyF {
+                        evt.prevent_default();
+                        show_search.set(!show_search());
+                        if !show_search() {
+                            // Clear search when closing
+                            search_pattern.set(String::new());
+                            search_results.set(Vec::new());
+                            current_result_index.set(None);
+                        }
+                    }
+                },
+
+                // Search bar
+                if show_search() {
+                    div {
+                        style: "background: #f0f0f0; border-bottom: 1px solid #ccc; padding: 8px; display: flex; align-items: center; gap: 8px;",
+
+                        // Search input
+                        input {
+                            r#type: "text",
+                            placeholder: "Search...",
+                            value: "{search_pattern}",
+                            oninput: move |e| search_pattern.set(e.value()),
+                            onkeydown: move |evt| {
+                                if evt.code() == Code::Escape {
+                                    show_search.set(false);
+                                    search_pattern.set(String::new());
+                                    search_results.set(Vec::new());
+                                    current_result_index.set(None);
+                                } else if evt.code() == Code::Enter {
+                                    evt.prevent_default();
+                                    // Trigger search on Enter - same as clicking Next
+                                    let pattern = search_pattern.read().clone();
+                                    if !pattern.is_empty() {
+                                        let content_str = content.read().clone();
+                                        let pattern_lower = pattern.to_lowercase();
+                                        let content_lower = content_str.to_lowercase();
+
+                                        // Find all occurrences
+                                        let mut results = Vec::new();
+                                        let mut start = 0;
+                                        while let Some(pos) = content_lower[start..].find(&pattern_lower) {
+                                            results.push(start + pos);
+                                            start = start + pos + 1;
+                                        }
+
+                                        search_results.set(results.clone());
+
+                                        if results.is_empty() {
+                                            current_result_index.set(None);
+                                        } else {
+                                            // Navigate to next or first if none selected
+                                            let new_index = match *current_result_index.read() {
+                                                None => Some(0),
+                                                Some(idx) => Some((idx + 1) % results.len()),
+                                            };
+                                            current_result_index.set(new_index);
+                                        }
+                                    }
+                                }
+                            },
+                            style: "flex: 1; padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px;",
+                        }
+
+                        // Previous button
+                        button {
+                            onclick: move |_| {
+                                let pattern = search_pattern.read().clone();
+                                if pattern.is_empty() {
+                                    search_results.set(Vec::new());
+                                    current_result_index.set(None);
+                                    return;
+                                }
+
+                                let content_str = content.read().clone();
+                                let pattern_lower = pattern.to_lowercase();
+                                let content_lower = content_str.to_lowercase();
+
+                                // Find all occurrences
+                                let mut results = Vec::new();
+                                let mut start = 0;
+                                while let Some(pos) = content_lower[start..].find(&pattern_lower) {
+                                    results.push(start + pos);
+                                    start = start + pos + 1;
+                                }
+
+                                search_results.set(results.clone());
+
+                                if results.is_empty() {
+                                    current_result_index.set(None);
+                                } else {
+                                    // Navigate to previous
+                                    let new_index = match *current_result_index.read() {
+                                        None => Some(0),
+                                        Some(idx) => {
+                                            Some(if idx == 0 { results.len() - 1 } else { idx - 1 })
+                                        }
+                                    };
+                                    current_result_index.set(new_index);
+                                }
+                            },
+                            style: "padding: 4px 12px; border: 1px solid #ccc; border-radius: 4px; background: white; cursor: pointer;",
+                            "<"
+                        }
+
+                        // Next button
+                        button {
+                            onclick: move |_| {
+                                let pattern = search_pattern.read().clone();
+                                if pattern.is_empty() {
+                                    search_results.set(Vec::new());
+                                    current_result_index.set(None);
+                                    return;
+                                }
+
+                                let content_str = content.read().clone();
+                                let pattern_lower = pattern.to_lowercase();
+                                let content_lower = content_str.to_lowercase();
+
+                                // Find all occurrences
+                                let mut results = Vec::new();
+                                let mut start = 0;
+                                while let Some(pos) = content_lower[start..].find(&pattern_lower) {
+                                    results.push(start + pos);
+                                    start = start + pos + 1;
+                                }
+
+                                search_results.set(results.clone());
+
+                                if results.is_empty() {
+                                    current_result_index.set(None);
+                                } else {
+                                    // Navigate to next
+                                    let new_index = match *current_result_index.read() {
+                                        None => Some(0),
+                                        Some(idx) => {
+                                            Some((idx + 1) % results.len())
+                                        }
+                                    };
+                                    current_result_index.set(new_index);
+                                }
+                            },
+                            style: "padding: 4px 12px; border: 1px solid #ccc; border-radius: 4px; background: white; cursor: pointer;",
+                            ">"
+                        }
+
+                        // Results indicator
+                        span {
+                            style: "color: #666; font-size: 14px; min-width: 60px; text-align: center;",
+                            {
+                                if search_pattern.read().is_empty() {
+                                    "-/-".to_string()
+                                } else if search_results.read().is_empty() {
+                                    "0/0".to_string()
+                                } else {
+                                    format!("{}/{}",
+                                        (*current_result_index.read()).map(|idx| (idx + 1).to_string()).unwrap_or_else(|| "-".to_string()),
+                                        search_results.read().len()
+                                    )
+                                }
+                            }
+                        }
+
+                        // Close button
+                        button {
+                            onclick: move |_| {
+                                show_search.set(false);
+                                search_pattern.set(String::new());
+                                search_results.set(Vec::new());
+                                current_result_index.set(None);
+                            },
+                            style: "padding: 4px 12px; border: 1px solid #ccc; border-radius: 4px; background: white; cursor: pointer;",
+                            "✕"
+                        }
+                    }
+                }
+
+                // Content area
                 div {
-                    style: "max-width: 800px; margin: 0 auto; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;",
-                    dangerous_inner_html: "{html_content}"
+                    style: "flex: 1; overflow-y: auto; overflow-x: hidden;",
+                    id: "content-area",
+                    div {
+                        style: "max-width: 800px; margin: 0 auto; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;",
+                        dangerous_inner_html: "{html_content}"
+                    }
                 }
             }
         }
@@ -377,6 +592,16 @@ fn markdown_to_html(content: &str, file_path: &Path, config: &MarkdownConfig) ->
         .task-list-item input[type="checkbox"] {{
             margin-right: 0.5em;
         }}
+
+        .search-highlight {{
+            background-color: #ffeb3b;
+            padding: 1px 0;
+        }}
+
+        .search-highlight.current {{
+            background-color: #ff9800;
+            color: white;
+        }}
     </style>
 </head>
 <body>
@@ -389,7 +614,12 @@ fn markdown_to_html(content: &str, file_path: &Path, config: &MarkdownConfig) ->
 
 fn transform_event<'a>(event: Event<'a>, file_path: &Path) -> Event<'a> {
     match event {
-        Event::Start(Tag::Image { dest_url, title, id, .. }) => {
+        Event::Start(Tag::Image {
+            dest_url,
+            title,
+            id,
+            ..
+        }) => {
             let transformed_url = transform_relative_path(&dest_url, file_path);
             Event::Start(Tag::Image {
                 dest_url: CowStr::Boxed(transformed_url.into()),
@@ -398,7 +628,12 @@ fn transform_event<'a>(event: Event<'a>, file_path: &Path) -> Event<'a> {
                 link_type: LinkType::Inline,
             })
         }
-        Event::Start(Tag::Link { dest_url, title, id, .. }) => {
+        Event::Start(Tag::Link {
+            dest_url,
+            title,
+            id,
+            ..
+        }) => {
             let transformed_url = transform_relative_path(&dest_url, file_path);
             Event::Start(Tag::Link {
                 dest_url: CowStr::Boxed(transformed_url.into()),
@@ -435,6 +670,51 @@ fn transform_relative_path(url: &str, file_path: &Path) -> String {
     }
 
     url.to_string()
+}
+
+fn highlight_search_results(
+    content: &str,
+    pattern: &str,
+    results: &[usize],
+    current_idx: Option<usize>,
+) -> String {
+    if pattern.is_empty() || results.is_empty() {
+        return content.to_string();
+    }
+
+    let mut highlighted = String::new();
+    let mut last_end = 0;
+
+    for (i, &pos) in results.iter().enumerate() {
+        // Add text before this match
+        highlighted.push_str(&content[last_end..pos]);
+
+        // Add highlighted match
+        let is_current = current_idx.map_or(false, |idx| idx == i);
+        let class = if is_current {
+            "search-highlight current"
+        } else {
+            "search-highlight"
+        };
+        let id = if is_current {
+            format!(" id=\"search-result-{}\"", i)
+        } else {
+            String::new()
+        };
+        highlighted.push_str(&format!(
+            "<span class=\"{}\"{}>{}</span>",
+            class,
+            id,
+            &content[pos..pos + pattern.len()]
+        ));
+
+        last_end = pos + pattern.len();
+    }
+
+    // Add remaining text
+    highlighted.push_str(&content[last_end..]);
+
+    highlighted
 }
 
 // Cargo.toml dependencies needed:

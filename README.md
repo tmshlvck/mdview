@@ -1,6 +1,15 @@
 # Simple and fast MarkDown viewer in Rust
 
-MarkDown viewer that can be used as an aid in writing MD - just open it next to your editor in tiled mode.
+MarkDown viewer that can be used as an aid in writing MD - just open it next to your editor in tiled mode. Features live reload and search functionality.
+
+## Features
+
+- **Live reload**: Automatically updates when the markdown file changes
+- **Search functionality** (Ctrl+F): Find text within the document with:
+  - Case-insensitive search
+  - Navigate between results with < and > buttons
+  - Visual highlighting of all matches
+  - Current match highlighted in a different color
 
 ## Build
 
