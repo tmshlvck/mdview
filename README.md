@@ -13,7 +13,7 @@ MarkDown viewer that can be used as an aid in writing MD - just open it next to 
 
 ## Build
 
-Dioxus deps
+### Dioxus deps -- Ubuntu
 ```
 sudo apt update
 sudo apt install libwebkit2gtk-4.1-dev \
@@ -25,14 +25,31 @@ sudo apt install libwebkit2gtk-4.1-dev \
   libssl-dev \
   libayatana-appindicator3-dev \
   librsvg2-dev
+```
 
+### Dioxus deps -- Fedora
+```
+sudo dnf install webkit2gtk4.1-devel \
+  openssl-devel \
+  curl \
+  wget \
+  file \
+  libappindicator-gtk3-devel \
+  librsvg2-devel \
+  libxdo-devel
+sudo dnf group install "c-development"
+```
+
+## Installation and usage example
+
+```
 cargo install dioxus-cli
-```
-
-## Installation and use
-
-```
 cargo install --path . --root ~/.local
+```
+
+Test on this `README.md`:
+
+```
 mdview README.md
 ```
 
