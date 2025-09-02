@@ -1,67 +1,38 @@
+use axum::{
+    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path as AxumPath, State},
+    http::{StatusCode, HeaderMap, header::{CONTENT_TYPE, CACHE_CONTROL}},
+    response::{Html, IntoResponse, Response},
+    routing::get,
+    Router,
+};
 use clap::{Arg, Command};
+use futures_util::{SinkExt, StreamExt};
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use pulldown_cmark::{html, CowStr, Event as MarkdownEvent, LinkType, Options, Parser, Tag};
+use std::{
+    collections::HashSet,
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::broadcast;
+use tower_http::services::ServeDir;
 
-use dioxus::prelude::*;
-use pulldown_cmark::{html, CowStr, Event, LinkType, Options, Parser, Tag};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-use url::Url;
-
-// Configuration constants
-const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct MarkdownConfig {
-    enable_tables: bool,
-    enable_footnotes: bool,
-    enable_strikethrough: bool,
-    enable_tasklists: bool,
-    enable_smart_punctuation: bool,
-    enable_heading_attributes: bool,
+#[derive(Clone, Debug)]
+struct AppState {
+    file_path: PathBuf,
+    root_dir: PathBuf,
+    reload_sender: broadcast::Sender<()>,
+    refresh_interval: Option<u64>,
 }
 
-impl Default for MarkdownConfig {
-    fn default() -> Self {
-        Self {
-            enable_tables: true,
-            enable_footnotes: true,
-            enable_strikethrough: true,
-            enable_tasklists: true,
-            enable_smart_punctuation: true,
-            enable_heading_attributes: true,
-        }
-    }
-}
-
-impl MarkdownConfig {
-    fn to_options(&self) -> Options {
-        let mut options = Options::empty();
-        if self.enable_tables {
-            options.insert(Options::ENABLE_TABLES);
-        }
-        if self.enable_footnotes {
-            options.insert(Options::ENABLE_FOOTNOTES);
-        }
-        if self.enable_strikethrough {
-            options.insert(Options::ENABLE_STRIKETHROUGH);
-        }
-        if self.enable_tasklists {
-            options.insert(Options::ENABLE_TASKLISTS);
-        }
-        if self.enable_smart_punctuation {
-            options.insert(Options::ENABLE_SMART_PUNCTUATION);
-        }
-        if self.enable_heading_attributes {
-            options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
-        }
-        options
-    }
-}
-
-fn main() {
-    let matches = Command::new("markdown-display")
-        .version("1.0")
-        .about("A Markdown display application with live preview")
+#[tokio::main]
+async fn main() {
+    let matches = Command::new("mdview")
+        .version("0.1.1")
+        .about("A fast markdown viewer with live reload")
         .arg(
             Arg::new("file")
                 .help("The markdown file to display")
@@ -69,54 +40,26 @@ fn main() {
                 .index(1),
         )
         .arg(
-            Arg::new("convert")
-                .long("convert")
-                .short('c')
-                .help("Convert to HTML and exit")
-                .action(clap::ArgAction::SetTrue),
+            Arg::new("port")
+                .long("port")
+                .short('p')
+                .help("Port to serve on (random if not specified)")
+                .value_name("PORT"),
         )
         .arg(
-            Arg::new("output")
-                .long("output")
-                .short('o')
-                .help("Output file for HTML conversion")
-                .value_name("FILE"),
+            Arg::new("refresh")
+                .long("refresh")
+                .short('r')
+                .help("Enable refresh mode with interval in seconds")
+                .value_name("SECONDS"),
         )
         .arg(
-            Arg::new("no-tables")
-                .long("no-tables")
-                .help("Disable table extensions")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("no-footnotes")
-                .long("no-footnotes")
-                .help("Disable footnote extensions")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("no-strikethrough")
-                .long("no-strikethrough")
-                .help("Disable strikethrough extensions")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("no-tasklists")
-                .long("no-tasklists")
-                .help("Disable task list extensions")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("no-smart-punctuation")
-                .long("no-smart-punctuation")
-                .help("Disable smart punctuation")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("no-heading-attributes")
-                .long("no-heading-attributes")
-                .help("Disable heading attributes")
-                .action(clap::ArgAction::SetTrue),
+            Arg::new("browser")
+                .long("browser")
+                .short('b')
+                .help("Browser to open (default, chrome, chrome-incognito, firefox, firefox-private, chromium, chromium-incognito)")
+                .value_name("BROWSER")
+                .default_value("default"),
         )
         .get_matches();
 
@@ -127,381 +70,284 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut config = MarkdownConfig::default();
-    if matches.get_flag("no-tables") {
-        config.enable_tables = false;
-    }
-    if matches.get_flag("no-footnotes") {
-        config.enable_footnotes = false;
-    }
-    if matches.get_flag("no-strikethrough") {
-        config.enable_strikethrough = false;
-    }
-    if matches.get_flag("no-tasklists") {
-        config.enable_tasklists = false;
-    }
-    if matches.get_flag("no-smart-punctuation") {
-        config.enable_smart_punctuation = false;
-    }
-    if matches.get_flag("no-heading-attributes") {
-        config.enable_heading_attributes = false;
-    }
+    let browser = matches.get_one::<String>("browser").unwrap().clone();
 
-    if matches.get_flag("convert") {
-        // One-off HTML conversion
-        let content = fs::read_to_string(&file_path).unwrap_or_else(|e| {
-            eprintln!("Error reading file: {}", e);
-            std::process::exit(1);
-        });
+    let port: u16 = matches
+        .get_one::<String>("port")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0); // 0 means random port
 
-        let html_content = markdown_to_html(&content, &file_path, &config);
+    let refresh_interval = matches
+        .get_one::<String>("refresh")
+        .and_then(|s| s.parse().ok());
 
-        if let Some(output_file) = matches.get_one::<String>("output") {
-            fs::write(output_file, html_content).unwrap_or_else(|e| {
-                eprintln!("Error writing output file: {}", e);
-                std::process::exit(1);
-            });
-            println!("HTML written to {}", output_file);
-        } else {
-            println!("{}", html_content);
+    let (reload_sender, _) = broadcast::channel(16);
+
+    let root_dir = file_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    
+    let state = AppState {
+        file_path: file_path.clone(),
+        root_dir,
+        reload_sender: reload_sender.clone(),
+        refresh_interval,
+    };
+
+    // Set up file watching
+    let watched_files = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    let reload_sender_clone = reload_sender.clone();
+    let watched_files_clone = watched_files.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = setup_file_watcher(file_path, reload_sender_clone, watched_files_clone).await {
+            eprintln!("File watcher error: {}", e);
         }
-        return;
+    });
+
+    // Create router
+    let app = Router::new()
+        .route("/", get(serve_markdown))
+        .route("/ws", get(websocket_handler))
+        .route("/md/*path", get(serve_linked_markdown))
+        .route("/files/*path", get(serve_file))
+        .nest_service("/static", ServeDir::new("static"))
+        .with_state(state);
+
+    // Start server
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let actual_addr = listener.local_addr().unwrap();
+
+    println!("Serving markdown at http://localhost:{}", actual_addr.port());
+
+    // Open browser
+    let url = format!("http://localhost:{}", actual_addr.port());
+    if let Err(e) = open_browser(&url, &browser) {
+        eprintln!("Failed to open browser: {}", e);
+        println!("Please open {} in your browser", url);
     }
 
-    // Store config and file path in environment for the GUI app
-    std::env::set_var("MDVIEW_FILE_PATH", file_path.to_string_lossy().as_ref());
-    std::env::set_var(
-        "MDVIEW_CONFIG",
-        serde_json::to_string(&config).unwrap_or_default(),
-    );
-
-    // Launch the GUI application with desktop config
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            dioxus::desktop::Config::new().with_menu(None).with_window(
-                dioxus::desktop::WindowBuilder::new()
-                    .with_title("Markdown Display")
-                    .with_resizable(true),
-            ),
-        )
-        .launch(app);
+    axum::serve(listener, app).await.unwrap();
 }
 
-fn app() -> Element {
-    // Get the file path and config from environment variables set by main()
-    let file_path = use_signal(|| {
-        if let Ok(path_str) = std::env::var("MDVIEW_FILE_PATH") {
-            PathBuf::from(path_str)
-        } else {
-            // Fallback to command line args if env var not set
-            let args: Vec<String> = std::env::args().collect();
-            if args.len() >= 2 {
-                PathBuf::from(&args[1])
-            } else {
-                PathBuf::from("README.md")
-            }
-        }
-    });
+async fn serve_markdown(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
+    let content = fs::read_to_string(&state.file_path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let config = use_signal(|| {
-        if let Ok(config_str) = std::env::var("MDVIEW_CONFIG") {
-            serde_json::from_str(&config_str).unwrap_or_default()
-        } else {
-            MarkdownConfig::default()
-        }
-    });
+    let html_content = markdown_to_html(&content, &state.file_path, state.refresh_interval);
+    Ok(Html(html_content))
+}
 
-    let mut content = use_signal(String::new);
-    let mut last_modified = use_signal(|| None::<std::time::SystemTime>);
+async fn serve_linked_markdown(
+    AxumPath(path): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Html<String>, StatusCode> {
+    // Security: prevent directory traversal
+    if path.contains("..") || path.contains("//") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
-    // Search state
-    let mut show_search = use_signal(|| false);
-    let mut search_pattern = use_signal(String::new);
-    let mut search_results = use_signal(|| Vec::<usize>::new());
-    let mut current_result_index = use_signal::<Option<usize>>(|| None);
+    let file_path = state.root_dir.join(&path);
+    
+    // Ensure it's a markdown file
+    if !file_path.extension().map_or(false, |ext| ext == "md" || ext == "markdown") {
+        return Err(StatusCode::NOT_FOUND);
+    }
 
-    // Load initial content
-    use_effect(move || {
-        let path = file_path();
-        if let Ok(file_content) = std::fs::read_to_string(&path) {
-            content.set(file_content);
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                if let Ok(modified) = metadata.modified() {
-                    last_modified.set(Some(modified));
-                }
-            }
-        }
-    });
+    // Check if file exists
+    if !file_path.exists() {
+        return Err(StatusCode::NOT_FOUND);
+    }
 
-    // Set up periodic file checking
-    use_effect(move || {
-        let mut interval = use_signal(|| Instant::now());
+    let content = fs::read_to_string(&file_path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+    // Render markdown without websocket/refresh functionality (only for main file)
+    let html_content = markdown_to_html(&content, &file_path, None);
+    Ok(Html(html_content))
+}
 
-                let now = Instant::now();
-                if now.duration_since(interval.read().clone()) >= MIN_REFRESH_INTERVAL {
-                    interval.set(now);
+async fn serve_file(
+    AxumPath(path): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Response, StatusCode> {
+    // Security: prevent directory traversal
+    if path.contains("..") || path.contains("//") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
-                    let path = file_path();
-                    if let Ok(metadata) = std::fs::metadata(&path) {
-                        if let Ok(modified) = metadata.modified() {
-                            let should_update = match last_modified.read().as_ref() {
-                                Some(last) => modified > *last,
-                                None => true,
-                            };
+    let file_path = state.root_dir.join(&path);
+    
+    // Check if file exists
+    if !file_path.exists() || !file_path.is_file() {
+        return Err(StatusCode::NOT_FOUND);
+    }
 
-                            if should_update {
-                                if let Ok(new_content) = std::fs::read_to_string(&path) {
-                                    content.set(new_content);
-                                    last_modified.set(Some(modified));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    });
+    let content = fs::read(&file_path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Scroll to current search result
-    use_effect(move || {
-        if let Some(_) = *current_result_index.read() {
-            // Note: In Dioxus 0.6, direct JS eval is not available
-            // The scrolling will happen via the id attributes in the HTML
-        }
-    });
+    let mime_type = get_mime_type(&file_path);
+    
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, mime_type.parse().unwrap());
+    headers.insert(CACHE_CONTROL, "public, max-age=3600".parse().unwrap());
 
-    let current_content = content.read();
-    if current_content.is_empty() {
-        rsx! {
-            div {
-                style: "width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;",
-                "Loading..."
-            }
-        }
-    } else {
-        let html_content = if search_pattern.read().is_empty() || search_results.read().is_empty() {
-            markdown_to_html(&current_content, &file_path(), &config())
-        } else {
-            // Highlight search results
-            let pattern = search_pattern.read().clone();
-            let results = search_results.read().clone();
-            let current_idx = *current_result_index.read();
-            let highlighted =
-                highlight_search_results(&current_content, &pattern, &results, current_idx);
-            markdown_to_html(&highlighted, &file_path(), &config())
-        };
+    Ok((headers, content).into_response())
+}
 
-        rsx! {
-            div {
-                style: "margin: 0; padding: 0; width: 100%; height: 100vh; display: flex; flex-direction: column;",
-                tabindex: "0",
-                onkeydown: move |evt| {
-                    if evt.modifiers().ctrl() && evt.code() == Code::KeyF {
-                        evt.prevent_default();
-                        show_search.set(!show_search());
-                        if !show_search() {
-                            // Clear search when closing
-                            search_pattern.set(String::new());
-                            search_results.set(Vec::new());
-                            current_result_index.set(None);
-                        }
-                    }
-                },
-
-                // Search bar
-                if show_search() {
-                    div {
-                        style: "background: #f0f0f0; border-bottom: 1px solid #ccc; padding: 8px; display: flex; align-items: center; gap: 8px;",
-
-                        // Search input
-                        input {
-                            r#type: "text",
-                            placeholder: "Search...",
-                            value: "{search_pattern}",
-                            oninput: move |e| search_pattern.set(e.value()),
-                            onkeydown: move |evt| {
-                                if evt.code() == Code::Escape {
-                                    show_search.set(false);
-                                    search_pattern.set(String::new());
-                                    search_results.set(Vec::new());
-                                    current_result_index.set(None);
-                                } else if evt.code() == Code::Enter {
-                                    evt.prevent_default();
-                                    // Trigger search on Enter - same as clicking Next
-                                    let pattern = search_pattern.read().clone();
-                                    if !pattern.is_empty() {
-                                        let content_str = content.read().clone();
-                                        let pattern_lower = pattern.to_lowercase();
-                                        let content_lower = content_str.to_lowercase();
-
-                                        // Find all occurrences
-                                        let mut results = Vec::new();
-                                        let mut start = 0;
-                                        while let Some(pos) = content_lower[start..].find(&pattern_lower) {
-                                            results.push(start + pos);
-                                            start = start + pos + 1;
-                                        }
-
-                                        search_results.set(results.clone());
-
-                                        if results.is_empty() {
-                                            current_result_index.set(None);
-                                        } else {
-                                            // Navigate to next or first if none selected
-                                            let new_index = match *current_result_index.read() {
-                                                None => Some(0),
-                                                Some(idx) => Some((idx + 1) % results.len()),
-                                            };
-                                            current_result_index.set(new_index);
-                                        }
-                                    }
-                                }
-                            },
-                            style: "flex: 1; padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px;",
-                        }
-
-                        // Previous button
-                        button {
-                            onclick: move |_| {
-                                let pattern = search_pattern.read().clone();
-                                if pattern.is_empty() {
-                                    search_results.set(Vec::new());
-                                    current_result_index.set(None);
-                                    return;
-                                }
-
-                                let content_str = content.read().clone();
-                                let pattern_lower = pattern.to_lowercase();
-                                let content_lower = content_str.to_lowercase();
-
-                                // Find all occurrences
-                                let mut results = Vec::new();
-                                let mut start = 0;
-                                while let Some(pos) = content_lower[start..].find(&pattern_lower) {
-                                    results.push(start + pos);
-                                    start = start + pos + 1;
-                                }
-
-                                search_results.set(results.clone());
-
-                                if results.is_empty() {
-                                    current_result_index.set(None);
-                                } else {
-                                    // Navigate to previous
-                                    let new_index = match *current_result_index.read() {
-                                        None => Some(0),
-                                        Some(idx) => {
-                                            Some(if idx == 0 { results.len() - 1 } else { idx - 1 })
-                                        }
-                                    };
-                                    current_result_index.set(new_index);
-                                }
-                            },
-                            style: "padding: 4px 12px; border: 1px solid #ccc; border-radius: 4px; background: white; cursor: pointer;",
-                            "<"
-                        }
-
-                        // Next button
-                        button {
-                            onclick: move |_| {
-                                let pattern = search_pattern.read().clone();
-                                if pattern.is_empty() {
-                                    search_results.set(Vec::new());
-                                    current_result_index.set(None);
-                                    return;
-                                }
-
-                                let content_str = content.read().clone();
-                                let pattern_lower = pattern.to_lowercase();
-                                let content_lower = content_str.to_lowercase();
-
-                                // Find all occurrences
-                                let mut results = Vec::new();
-                                let mut start = 0;
-                                while let Some(pos) = content_lower[start..].find(&pattern_lower) {
-                                    results.push(start + pos);
-                                    start = start + pos + 1;
-                                }
-
-                                search_results.set(results.clone());
-
-                                if results.is_empty() {
-                                    current_result_index.set(None);
-                                } else {
-                                    // Navigate to next
-                                    let new_index = match *current_result_index.read() {
-                                        None => Some(0),
-                                        Some(idx) => {
-                                            Some((idx + 1) % results.len())
-                                        }
-                                    };
-                                    current_result_index.set(new_index);
-                                }
-                            },
-                            style: "padding: 4px 12px; border: 1px solid #ccc; border-radius: 4px; background: white; cursor: pointer;",
-                            ">"
-                        }
-
-                        // Results indicator
-                        span {
-                            style: "color: #666; font-size: 14px; min-width: 60px; text-align: center;",
-                            {
-                                if search_pattern.read().is_empty() {
-                                    "-/-".to_string()
-                                } else if search_results.read().is_empty() {
-                                    "0/0".to_string()
-                                } else {
-                                    format!("{}/{}",
-                                        (*current_result_index.read()).map(|idx| (idx + 1).to_string()).unwrap_or_else(|| "-".to_string()),
-                                        search_results.read().len()
-                                    )
-                                }
-                            }
-                        }
-
-                        // Close button
-                        button {
-                            onclick: move |_| {
-                                show_search.set(false);
-                                search_pattern.set(String::new());
-                                search_results.set(Vec::new());
-                                current_result_index.set(None);
-                            },
-                            style: "padding: 4px 12px; border: 1px solid #ccc; border-radius: 4px; background: white; cursor: pointer;",
-                            "✕"
-                        }
-                    }
-                }
-
-                // Content area
-                div {
-                    style: "flex: 1; overflow-y: auto; overflow-x: hidden;",
-                    id: "content-area",
-                    div {
-                        style: "max-width: 800px; margin: 0 auto; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;",
-                        dangerous_inner_html: "{html_content}"
-                    }
-                }
-            }
-        }
+fn get_mime_type(file_path: &Path) -> &'static str {
+    match file_path.extension().and_then(|ext| ext.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("css") => "text/css",
+        Some("js") => "application/javascript",
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        _ => "application/octet-stream",
     }
 }
 
-fn markdown_to_html(content: &str, file_path: &Path, config: &MarkdownConfig) -> String {
-    let options = config.to_options();
-    let parser = Parser::new_ext(content, options);
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> Response {
+    ws.on_upgrade(|socket| handle_websocket(socket, state))
+}
 
+async fn handle_websocket(socket: WebSocket, state: AppState) {
+    let mut rx = state.reload_sender.subscribe();
+    let (sender, mut receiver) = socket.split();
+    let sender = Arc::new(tokio::sync::Mutex::new(sender));
+
+    // Handle incoming messages (ping/pong)
+    let ping_task = tokio::spawn(async move {
+        while let Some(msg) = receiver.next().await {
+            if let Ok(Message::Pong(_)) = msg {
+                // Client is alive
+            }
+        }
+    });
+
+    // Send reload notifications
+    let reload_sender = sender.clone();
+    let reload_task = tokio::spawn(async move {
+        while let Ok(_) = rx.recv().await {
+            let mut sender = reload_sender.lock().await;
+            if sender.send(Message::Text("reload".to_string())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Send periodic pings
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+    let ping_sender = sender.clone();
+    let ping_ping_task = tokio::spawn(async move {
+        loop {
+            ping_interval.tick().await;
+            let mut sender = ping_sender.lock().await;
+            if sender.send(Message::Ping(vec![])).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Wait for any task to complete
+    tokio::select! {
+        _ = ping_task => {},
+        _ = reload_task => {},
+        _ = ping_ping_task => {},
+    }
+}
+
+async fn setup_file_watcher(
+    file_path: PathBuf,
+    reload_sender: broadcast::Sender<()>,
+    _watched_files: Arc<tokio::sync::Mutex<HashSet<PathBuf>>>,
+) -> notify::Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let mut watcher = RecommendedWatcher::new(
+        move |res: notify::Result<Event>| {
+            if let Ok(event) = res {
+                let _ = tx.send(event);
+            }
+        },
+        Config::default(),
+    )?;
+
+    watcher.watch(&file_path, RecursiveMode::NonRecursive)?;
+
+    // Also watch the directory for new files
+    if let Some(parent) = file_path.parent() {
+        watcher.watch(parent, RecursiveMode::NonRecursive)?;
+    }
+
+    while let Some(event) = rx.recv().await {
+        let paths: Vec<PathBuf> = event.paths;
+        let should_reload = paths.iter().any(|path| {
+            path == &file_path || path.extension().map_or(false, |ext| ext == "md" || ext == "markdown")
+        });
+
+        if should_reload {
+            let _ = reload_sender.send(());
+        }
+    }
+
+    Ok(())
+}
+
+fn markdown_to_html(content: &str, file_path: &Path, refresh_interval: Option<u64>) -> String {
+    let parser = Parser::new_ext(content, Options::all());
+
+    let root_dir = file_path.parent().unwrap_or(Path::new("."));
+    
     // Transform events to handle relative paths
-    let events: Vec<Event> = parser
-        .map(|event| transform_event(event, file_path))
+    let events: Vec<MarkdownEvent> = parser
+        .map(|event| transform_event(event, file_path, root_dir))
         .collect();
 
     let mut html_output = String::new();
     html::push_html(&mut html_output, events.into_iter());
+
+    let websocket_script = if refresh_interval.is_some() {
+        format!(
+            r#"
+            <script>
+                setInterval(() => {{
+                    location.reload();
+                }}, {}000);
+            </script>
+            "#,
+            refresh_interval.unwrap()
+        )
+    } else {
+        r#"
+        <script>
+            const ws = new WebSocket(`ws://${window.location.host}/ws`);
+            ws.onmessage = function(event) {
+                if (event.data === 'reload') {
+                    location.reload();
+                }
+            };
+            ws.onclose = function() {
+                // Reconnect after a short delay
+                setTimeout(() => {
+                    location.reload();
+                }, 1000);
+            };
+        </script>
+        "#.to_string()
+    };
 
     format!(
         r#"<!DOCTYPE html>
@@ -509,6 +355,7 @@ fn markdown_to_html(content: &str, file_path: &Path, config: &MarkdownConfig) ->
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Markdown Viewer</title>
     <style>
         * {{
             box-sizing: border-box;
@@ -518,13 +365,15 @@ fn markdown_to_html(content: &str, file_path: &Path, config: &MarkdownConfig) ->
             margin: 0;
             padding: 0;
             height: 100%;
-            overflow: hidden;
         }}
 
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             line-height: 1.6;
             color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
         }}
 
         h1, h2, h3, h4, h5, h6 {{
@@ -592,50 +441,41 @@ fn markdown_to_html(content: &str, file_path: &Path, config: &MarkdownConfig) ->
         .task-list-item input[type="checkbox"] {{
             margin-right: 0.5em;
         }}
-
-        .search-highlight {{
-            background-color: #ffeb3b;
-            padding: 1px 0;
-        }}
-
-        .search-highlight.current {{
-            background-color: #ff9800;
-            color: white;
-        }}
     </style>
 </head>
 <body>
 {}
+{}
 </body>
 </html>"#,
-        html_output
+        html_output, websocket_script
     )
 }
 
-fn transform_event<'a>(event: Event<'a>, file_path: &Path) -> Event<'a> {
+fn transform_event<'a>(event: MarkdownEvent<'a>, file_path: &Path, root_dir: &Path) -> MarkdownEvent<'a> {
     match event {
-        Event::Start(Tag::Image {
+        MarkdownEvent::Start(Tag::Image {
             dest_url,
             title,
             id,
             ..
         }) => {
             let transformed_url = transform_relative_path(&dest_url, file_path);
-            Event::Start(Tag::Image {
+            MarkdownEvent::Start(Tag::Image {
                 dest_url: CowStr::Boxed(transformed_url.into()),
                 title,
                 id,
                 link_type: LinkType::Inline,
             })
         }
-        Event::Start(Tag::Link {
+        MarkdownEvent::Start(Tag::Link {
             dest_url,
             title,
             id,
             ..
         }) => {
             let transformed_url = transform_relative_path(&dest_url, file_path);
-            Event::Start(Tag::Link {
+            MarkdownEvent::Start(Tag::Link {
                 dest_url: CowStr::Boxed(transformed_url.into()),
                 title,
                 id,
@@ -647,84 +487,100 @@ fn transform_event<'a>(event: Event<'a>, file_path: &Path) -> Event<'a> {
 }
 
 fn transform_relative_path(url: &str, file_path: &Path) -> String {
-    // Check if it's already an absolute URL
-    if Url::parse(url).is_ok() {
+    // Check if it's already an absolute URL or starts with http/https
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("//") {
         return url.to_string();
     }
 
-    // Check if it's an absolute path
+    // Check if it's already a server path
     if url.starts_with('/') {
         return url.to_string();
     }
 
-    // Transform relative path
+    // Transform relative path to HTTP URL
     if let Some(parent) = file_path.parent() {
         let full_path = parent.join(url);
-        if let Ok(canonical) = full_path.canonicalize() {
-            // Print canonical path for local files
-            return canonical.display().to_string();
-        } else {
-            // Fallback: just join the paths
-            return parent.join(url).display().to_string();
+        
+        // Check if it's a markdown file
+        if let Some(ext) = full_path.extension() {
+            if ext == "md" || ext == "markdown" {
+                return format!("/md/{}", url);
+            }
         }
+        
+        // For other files (images, etc.), serve through /files/ route
+        return format!("/files/{}", url);
     }
 
     url.to_string()
 }
 
-fn highlight_search_results(
-    content: &str,
-    pattern: &str,
-    results: &[usize],
-    current_idx: Option<usize>,
-) -> String {
-    if pattern.is_empty() || results.is_empty() {
-        return content.to_string();
+fn open_browser(url: &str, browser: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let result = match browser {
+        "chrome" => open_chrome(url, false),
+        "chrome-incognito" => open_chrome(url, true),
+        "firefox" => open_firefox(url, false),
+        "firefox-private" => open_firefox(url, true),
+        "chromium" => open_chromium(url, false),
+        "chromium-incognito" => open_chromium(url, true),
+        "default" | _ => open_default_browser(url),
+    };
+
+    // If specific browser fails, fall back to default
+    if result.is_err() && browser != "default" {
+        eprintln!("Failed to open {}, falling back to default browser", browser);
+        open_default_browser(url)
+    } else {
+        result
     }
-
-    let mut highlighted = String::new();
-    let mut last_end = 0;
-
-    for (i, &pos) in results.iter().enumerate() {
-        // Add text before this match
-        highlighted.push_str(&content[last_end..pos]);
-
-        // Add highlighted match
-        let is_current = current_idx.map_or(false, |idx| idx == i);
-        let class = if is_current {
-            "search-highlight current"
-        } else {
-            "search-highlight"
-        };
-        let id = if is_current {
-            format!(" id=\"search-result-{}\"", i)
-        } else {
-            String::new()
-        };
-        highlighted.push_str(&format!(
-            "<span class=\"{}\"{}>{}</span>",
-            class,
-            id,
-            &content[pos..pos + pattern.len()]
-        ));
-
-        last_end = pos + pattern.len();
-    }
-
-    // Add remaining text
-    highlighted.push_str(&content[last_end..]);
-
-    highlighted
 }
 
-// Cargo.toml dependencies needed:
-/*
-[dependencies]
-clap = { version = "4.0", features = ["derive"] }
-dioxus = { version = "0.6", features = ["desktop"] }
-pulldown-cmark = { version = "0.12", features = ["simd"] }
-tokio = { version = "1.0", features = ["full"] }
-url = "2.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-*/
+fn open_chrome(url: &str, incognito: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = std::process::Command::new("google-chrome");
+    cmd.arg("--new-window");
+    if incognito {
+        cmd.arg("--incognito");
+    }
+    cmd.arg(url);
+    cmd.spawn()?;
+    Ok(())
+}
+
+fn open_chromium(url: &str, incognito: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = std::process::Command::new("chromium");
+    cmd.arg("--new-window");
+    if incognito {
+        cmd.arg("--incognito");
+    }
+    cmd.arg(url);
+    cmd.spawn()?;
+    Ok(())
+}
+
+fn open_firefox(url: &str, private: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = std::process::Command::new("firefox");
+    if private {
+        cmd.arg("--private-window");
+    } else {
+        cmd.arg("--new-window");
+    }
+    cmd.arg(url);
+    cmd.spawn()?;
+    Ok(())
+}
+
+fn open_default_browser(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd").args(["/c", "start", url]).spawn()?;
+    }
+    Ok(())
+}
