@@ -452,7 +452,7 @@ fn markdown_to_html(content: &str, file_path: &Path, refresh_interval: Option<u6
     )
 }
 
-fn transform_event<'a>(event: MarkdownEvent<'a>, file_path: &Path, root_dir: &Path) -> MarkdownEvent<'a> {
+fn transform_event<'a>(event: MarkdownEvent<'a>, file_path: &Path, _root_dir: &Path) -> MarkdownEvent<'a> {
     match event {
         MarkdownEvent::Start(Tag::Image {
             dest_url,
